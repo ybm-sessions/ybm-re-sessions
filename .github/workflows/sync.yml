@@ -1,0 +1,124 @@
+name: Sync Sessions
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟
+  workflow_dispatch: {}  # 手动触发
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install lark-cli
+        run: |
+          curl -L -o lark-cli.tar.gz https://github.com/larksuite/oapi-sdk-go/releases/download/v3.0.0/lark-cli_3.0.0_linux_amd64.tar.gz 2>/dev/null || true
+          # 如果 lark-cli 没有 GitHub release，用 Go API 直接调
+      - name: Sync sessions from Feishu
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+        run: |
+          node -e "
+          const https = require('https');
+          const fs = require('fs');
+
+          // 1. 获取 tenant_access_token
+          const tokenReq = JSON.stringify({app_id: process.env.FEISHU_APP_ID, app_secret: process.env.FEISHU_APP_SECRET});
+          function post(path, data, token) {
+            return new Promise((resolve, reject) => {
+              const body = JSON.stringify(data);
+              const headers = {'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body)};
+              if (token) headers['Authorization'] = 'Bearer ' + token;
+              const req = https.request({hostname: 'open.feishu.cn', path, method: 'POST', headers}, res => {
+                let b = ''; res.on('data', c => b += c); res.on('end', () => resolve(JSON.parse(b)));
+              });
+              req.write(body); req.end();
+            });
+          }
+          function get(path, token) {
+            return new Promise((resolve, reject) => {
+              const headers = {};
+              if (token) headers['Authorization'] = 'Bearer ' + token;
+              const req = https.request({hostname: 'open.feishu.cn', path, method: 'GET', headers}, res => {
+                let b = ''; res.on('data', c => b += c); res.on('end', () => resolve(JSON.parse(b)));
+              });
+              req.end();
+            });
+          }
+
+          (async () => {
+            // 获取 token
+            const tokenRes = await post('/open-apis/auth/v3/tenant_access_token/internal', {app_id: process.env.FEISHU_APP_ID, app_secret: process.env.FEISHU_APP_SECRET});
+            const token = tokenRes.tenant_access_token;
+            if (!token) { console.log('FAIL: no token', JSON.stringify(tokenRes)); process.exit(1); }
+
+            // 读中转表
+            const BASE_TOKEN = 'Y3UJbSb4ba2dhCsa1FZcL8BBnWh';
+            const TABLE_ID = 'tblc7zIXyJqdJbac';
+            const listRes = await get('/open-apis/bitable/v1/apps/' + BASE_TOKEN + '/tables/' + TABLE_ID + '/records?page_size=100', token);
+            const items = (listRes.data && listRes.data.items) || [];
+            const now = Date.now();
+            const TEN_MIN = 10 * 60 * 1000;
+            const sessions = [];
+            for (const it of items) {
+              const f = it.fields || {};
+              let name = '';
+              const rawName = f['你是谁'];
+              if (Array.isArray(rawName) && rawName[0]) name = String(rawName[0].name || rawName[0] || '').trim();
+              else name = String(rawName || '').trim();
+              const code = String(f['会话码'] || '').trim();
+              if (!name || !code) continue;
+              const ts = it.created_time ? Date.parse(it.created_time) : now;
+              if (now - ts > TEN_MIN) continue;
+              sessions.push({code, name: name.slice(0, 12), t: ts});
+            }
+
+            // 读集章表
+            const BADGE_TABLE = 'tbljAyO3TqGFYNoM';
+            const badgeRes = await get('/open-apis/bitable/v1/apps/' + BASE_TOKEN + '/tables/' + BADGE_TABLE + '/records?page_size=200', token);
+            const badgeItems = (badgeRes.data && badgeRes.data.items) || [];
+            const badges = [];
+            for (const it of badgeItems) {
+              const f = it.fields || {};
+              let name = '';
+              const rawName = f['玩家'];
+              if (Array.isArray(rawName) && rawName[0]) name = String(rawName[0].name || rawName[0] || '').trim();
+              else name = String(rawName || '').trim();
+              const gId = String(f['游戏ID'] || '');
+              const score = parseInt(f['分数']) || 0;
+              if (!name || !gId) continue;
+              badges.push({player: name, gameId: gId, score, t: parseInt(f['更新时间']) || 0});
+            }
+
+            // 读签名墙表
+            const SIGN_TABLE = 'tblp7zgfZ516c0Ec';
+            const signRes = await get('/open-apis/bitable/v1/apps/' + BASE_TOKEN + '/tables/' + SIGN_TABLE + '/records?page_size=200', token);
+            const signItems = (signRes.data && signRes.data.items) || [];
+            const signMap = {};
+            for (const it of signItems) {
+              const f = it.fields || {};
+              let name = '';
+              const rawName = f['玩家'];
+              if (Array.isArray(rawName) && rawName[0]) name = String(rawName[0].name || rawName[0] || '').trim();
+              else name = String(rawName || '').trim();
+              const t = parseInt(f['时间戳']) || 0;
+              if (!name) continue;
+              if (!signMap[name] || t > signMap[name].t) signMap[name] = {name, t};
+            }
+            const signs = Object.values(signMap).sort((a, b) => a.t - b.t);
+
+            // 写文件
+            fs.writeFileSync('sessions.json', JSON.stringify({ok: true, updated: now, sessions}, null, 0));
+            fs.writeFileSync('badges.json', JSON.stringify({ok: true, updated: now, badges}, null, 0));
+            fs.writeFileSync('signs.json', JSON.stringify({ok: true, updated: now, signs}, null, 0));
+            console.log('sessions:', sessions.length, 'badges:', badges.length, 'signs:', signs.length);
+          })();
+          "
+      - name: Commit and push
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add sessions.json badges.json signs.json
+          git diff --staged --quiet || (git commit -m "sync $(date -u +%Y-%m-%dT%H:%M:%SZ)" && git push)
